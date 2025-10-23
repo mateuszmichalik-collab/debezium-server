@@ -49,6 +49,7 @@ public class EventHubsChangeConsumer extends BaseChangeConsumer
     private static final String PROP_EVENTHUB_NAME = PROP_PREFIX + "hubname";
     private static final String PROP_PARTITION_ID = PROP_PREFIX + "partitionid";
     private static final String PROP_PARTITION_KEY = PROP_PREFIX + "partitionkey";
+    private static final String PROP_DYNAMIC_PARTITION_ROUTING_KEY = PROP_PREFIX + "dynamicpartitionrouting";
     // maximum size for the batch of events (bytes)
     private static final String PROP_MAX_BATCH_SIZE = PROP_PREFIX + "maxbatchsize";
     private static final String PROP_HASH_MESSAGE_KEY_FUNCTION = PROP_PREFIX + "hashmessagekeyfunction";
@@ -57,6 +58,7 @@ public class EventHubsChangeConsumer extends BaseChangeConsumer
     private String eventHubName;
     private String configuredPartitionId;
     private String configuredPartitionKey;
+    private String dynamicPartitionRouting;
     private Integer maxBatchSize;
     private Integer partitionCount;
     private Optional<HashFunction> hashMessageFunction;
@@ -89,6 +91,10 @@ public class EventHubsChangeConsumer extends BaseChangeConsumer
         maxBatchSize = config.getOptionalValue(PROP_MAX_BATCH_SIZE, Integer.class).orElse(0);
         configuredPartitionId = config.getOptionalValue(PROP_PARTITION_ID, String.class).orElse("");
         configuredPartitionKey = config.getOptionalValue(PROP_PARTITION_KEY, String.class).orElse("");
+        if (!configuredPartitionId.isEmpty() || !configuredPartitionKey.isEmpty())
+            dynamicPartitionRouting = "default";
+        else
+            dynamicPartitionRouting = config.getOptionalValue(PROP_DYNAMIC_PARTITION_ROUTING_KEY, String.class).orElse("default");
         hashMessageFunction = config.getOptionalValue(PROP_HASH_MESSAGE_KEY_FUNCTION, String.class)
                 .map(HashFunction::fromString);
 
@@ -125,12 +131,25 @@ public class EventHubsChangeConsumer extends BaseChangeConsumer
         }
     }
 
+    String getPartitionKey(ChangeEvent<Object, Object> record) {
+        String initialPartitionKey = getString(record.key());
+        return hashMessageFunction
+                .map(hasher -> hasher.hash().apply(initialPartitionKey))
+                .orElse(initialPartitionKey);
+    }
+
+    Integer getPartitionId(ChangeEvent<Object, Object> record) {
+        if (record.partition() == null || Objects.equals(dynamicPartitionRouting, "key"))
+            return BatchManager.BATCH_INDEX_FOR_NO_PARTITION_ID;
+        else
+            return record.partition();
+    }
+
     @Override
     public void handleBatch(List<ChangeEvent<Object, Object>> records,
                             RecordCommitter<ChangeEvent<Object, Object>> committer)
             throws InterruptedException {
         LOGGER.trace("Event Hubs sink adapter processing change events");
-
         batchManager.initializeBatch();
 
         for (int recordIndex = 0; recordIndex < records.size();) {
@@ -140,11 +159,9 @@ public class EventHubsChangeConsumer extends BaseChangeConsumer
             // The inner loop adds as many records to the batch as possible, keeping track of the batch size
             for (; recordIndex < records.size(); recordIndex++) {
                 ChangeEvent<Object, Object> record = records.get(recordIndex);
-
                 if (null == record.value()) {
                     continue;
                 }
-
                 EventData eventData;
                 if (record.value() instanceof String) {
                     eventData = new EventData((String) record.value());
@@ -159,9 +176,8 @@ public class EventHubsChangeConsumer extends BaseChangeConsumer
                 }
 
                 // Find the partition to send eventData to.
-                Integer targetPartitionId;
+                Integer targetPartitionId = null;
                 String dynamicPartitionKey = null;
-
                 if (!configuredPartitionId.isEmpty()) {
                     targetPartitionId = Integer.parseInt(configuredPartitionId);
                 }
@@ -170,23 +186,19 @@ public class EventHubsChangeConsumer extends BaseChangeConsumer
                     targetPartitionId = BatchManager.BATCH_INDEX_FOR_PARTITION_KEY;
                 }
                 else {
-                    if (record.key() != null) {
-                        String initialPartitionKey = getString(record.key());
-
-                        dynamicPartitionKey = hashMessageFunction
-                                .map(hasher -> hasher.hash().apply(initialPartitionKey))
-                                .orElse(initialPartitionKey);
-
-                        targetPartitionId = null;
-                    }
-                    else {
-                        targetPartitionId = record.partition();
-                        if (targetPartitionId == null) {
-                            targetPartitionId = BatchManager.BATCH_INDEX_FOR_NO_PARTITION_ID;
-                        }
+                    switch (dynamicPartitionRouting) {
+                        case "partitionid":
+                            targetPartitionId = getPartitionId(record);
+                            break;
+                        default:
+                            if (record.key() != null) {
+                                dynamicPartitionKey = getPartitionKey(record);
+                            }
+                            else {
+                                targetPartitionId = getPartitionId(record);
+                            }
                     }
                 }
-
                 try {
                     if (dynamicPartitionKey != null) {
                         batchManager.sendEventWithDynamicPartitionKey(eventData, dynamicPartitionKey);
@@ -197,7 +209,6 @@ public class EventHubsChangeConsumer extends BaseChangeConsumer
                             throw new IndexOutOfBoundsException(
                                     String.format("Target partition id %d does not exist in target EventHub %s", targetPartitionId, eventHubName));
                         }
-
                         batchManager.sendEventToPartitionId(eventData, recordIndex, targetPartitionId);
                     }
                 }
